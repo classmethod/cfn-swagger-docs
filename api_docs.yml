@@ -1,0 +1,221 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: API documents
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Build Settings"
+        Parameters:
+          - BuildSpec
+      - Label:
+          default: "Github Repository Settings"
+        Parameters:
+          - GitHubOwner
+          - GitHubRepo
+          - GitHubBranch
+      - Label:
+          default: "Github OAuth"
+        Parameters:
+          - GitHubOAuthToken
+      - Label:
+          default: "Github Webhook"
+        Parameters:
+          - SecretToken
+    ParameterLabels:
+      GitHubOwner:
+        default: "Owner"
+      GitHubRepo:
+        default: "Repository"
+      GitHubBranch:
+        default: "Branch"
+      GitHubOAuthToken:
+        default: "OAuthToken"
+      SecretToken:
+        default: "SecretToken"
+      BuildSpec:
+        default: "BuildSpec"
+Parameters:
+  GitHubOwner:
+    Type: String
+  GitHubRepo:
+    Type: String
+  GitHubBranch:
+    Type: String
+    Default: develop
+  GitHubOAuthToken:
+    Type: String
+    NoEcho: true
+  SecretToken:
+    Type: String
+  BuildSpec:
+    Type: String
+    Default: buildspec.yml
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub api-docs-${AWS::Region}-${AWS::AccountId}
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: api-docs
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: "1"
+            Action: s3:GetObject
+            Effect: Allow
+            Resource: !Sub arn:aws:s3:::${S3Bucket}/*
+            Principal:
+              AWS: !Sub arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+        - Id: !Sub S3-${S3Bucket.DomainName}
+          DomainName: !GetAtt S3Bucket.DomainName
+          S3OriginConfig:
+            OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub S3-${S3Bucket.DomainName}
+          ViewerProtocolPolicy: allow-all
+          ForwardedValues:
+            QueryString: false
+        PriceClass: PriceClass_200
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub artifact-${AWS::Region}-${AWS::AccountId}
+  ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      RoleName: api_docs_role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Resource:
+                  - !Sub arn:aws:s3:::${ArtifactBucket}/*
+                  - !Sub arn:aws:s3:::${S3Bucket}/*
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: api-docs
+      ServiceRole: !GetAtt ServiceRole.Arn   
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Ref BuildSpec
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: sourcey/spectacle
+        Type: LINUX_CONTAINER
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: api-docs
+      RoleArn: !GetAtt ServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: PullFromGithub
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: 1
+              RunOrder: 1
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubOAuthToken
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceArtifact
+        - Name: Build
+          Actions:
+            - Name: BuildAPIDocuments
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              RunOrder: 1
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+        - Name: Deploy
+          Actions:
+            - Name: Upload
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              Configuration:
+                BucketName: !Ref S3Bucket
+                Extract: true
+              RunOrder: 1
+              InputArtifacts:
+                - Name: BuildArtifact
+  PipelineWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: !Ref SecretToken
+      Filters:
+        -
+          JsonPath: "$.ref"
+          MatchEquals: refs/heads/{Branch}
+      TargetPipeline: !Ref CodePipeline
+      TargetAction: PullFromGithub
+      TargetPipelineVersion: !GetAtt CodePipeline.Version
+      RegisterWithThirdParty: true
+Outputs:
+  ApiDocsUrl:
+    Value: !Join [ "", [ "https://", !GetAtt [ Distribution, DomainName ]]]

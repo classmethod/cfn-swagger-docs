@@ -1,0 +1,12 @@
+version: 0.2
+phases:
+  build:
+    commands:
+      - echo Build started on `date`
+      - spectacle --version
+      - mkdir build
+      - spectacle -t build api.swagger.yml
+artifacts:
+  base-directory: build
+  files:
+    - "**/*"
